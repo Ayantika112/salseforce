@@ -1,4 +1,4 @@
-public class TranscriptProcessorQueueable_UP implements Queueable, Database.AllowsCallouts {
+public class TranscriptProcessorQueueable implements Queueable, Database.AllowsCallouts {
     private Id logId;
     private String transcriptId;
 
