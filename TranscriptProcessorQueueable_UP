@@ -1,0 +1,35 @@
+public class TranscriptProcessorQueueable_UP implements Queueable, Database.AllowsCallouts {
+    private Id logId;
+    private String transcriptId;
+
+    public TranscriptProcessorQueueable(Id logId, String transcriptId) {
+        this.logId = logId;
+        this.transcriptId = transcriptId;
+    }
+
+    public void execute(QueueableContext context) {
+        try {
+            String result = AssemblyAIFromSalesforce_UP.getTranscriptionResult(transcriptId);
+
+            if (!String.isBlank(result)) {
+                CallLog__c log = new CallLog__c(
+                    Id = logId,
+                    transcript_Desc__c = result,
+                    Call_Status__c = 'Completed'
+                );
+
+                try {
+                    String jsonData = PromptInvoker.FetchRulesDetails(log.Id);
+                    InsertDataWithPromptResult.StringToJson(jsonData);
+                    System.debug('Prompt invoked for log: ' + log.Id);
+                } catch (Exception ex) {
+                    System.debug('Prompt error for log ' + log.Id + ': ' + ex.getMessage());
+                }
+
+                update log;
+            }
+        } catch (Exception e) {
+            System.debug('Error fetching transcript for ID ' + transcriptId + ': ' + e.getMessage());
+        }
+    }
+}
