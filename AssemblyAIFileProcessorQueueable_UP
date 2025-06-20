@@ -1,4 +1,4 @@
-public class AssemblyAIFileProcessorQueueable_UP implements Queueable, Database.AllowsCallouts {
+public class AssemblyAIFileProcessorQueueable implements Queueable, Database.AllowsCallouts {
     private Set<Id> contentDocumentIds;
 
     public AssemblyAIFileProcessorQueueable(Set<Id> contentDocumentIds) {
