@@ -1,0 +1,223 @@
+public with sharing class AssemblyAIFromSalesforce_UP {
+
+    public static final String API_KEY = '7a84eca123cd4d8b92e9bfcf59eb78bb'; // Replace with your key
+    public static final Id ClientID = 'a03gL000006FSbdQAG';
+    public static final Id AgentID = 'a02gL000002CDDFQA4';
+    public static final Id ContactID = '003gL000006BSbqQAG';
+
+    // Step 1: Triggered when a file is uploaded to CallLog__c
+    public static void handleFileUpload(Set<Id> contentDocumentIds) {
+        System.debug('=== handleFileUpload START ===');
+
+        // Step 1.1: Map ContentDocumentId -> CallLog__c.Id
+        Map<Id, Id> docToEntityMap = new Map<Id, Id>();
+        for (ContentDocumentLink cdl : [
+            SELECT ContentDocumentId, LinkedEntityId
+            FROM ContentDocumentLink
+            WHERE ContentDocumentId IN :contentDocumentIds
+        ]) {
+            if (cdl.LinkedEntityId != null ) {
+                docToEntityMap.put(cdl.ContentDocumentId, cdl.LinkedEntityId);
+            }
+        }
+
+        // Step 1.2: Fetch latest version of each file
+        Map<Id, ContentVersion> docVersionMap = new Map<Id, ContentVersion>();
+        for (ContentVersion cv : [
+            SELECT Id, ContentDocumentId, VersionData, Title, FileExtension
+            FROM ContentVersion
+            WHERE ContentDocumentId IN :docToEntityMap.keySet()
+            ORDER BY CreatedDate DESC
+        ]) {
+            if (!docVersionMap.containsKey(cv.ContentDocumentId)) {
+                docVersionMap.put(cv.ContentDocumentId, cv);
+            }
+        }
+
+        // Step 1.3: Supported file types
+        Set<String> supportedTypes = new Set<String>{'ogg','aac','mp3','wav','m4a','flac'};
+
+        List<CallLog__c> logsToUpdate = new List<CallLog__c>();
+
+        // Step 1.4: Process each document
+        for (Id docId : docToEntityMap.keySet()) {
+            ContentVersion cv = docVersionMap.get(docId);
+            if (cv == null || !supportedTypes.contains(cv.FileExtension.toLowerCase())) {
+                System.debug('Unsupported or missing file for docId: ' + docId);
+                continue;
+            }
+
+            try {
+                // Step 1.5: Upload to AssemblyAI
+                String uploadUrl = uploadAudioToAssemblyAI(cv.Id);
+                System.debug('Uploaded to AssemblyAI for: ' + cv.Title);
+
+                // Step 1.6: Request transcription
+                String transcriptId = requestTranscription(uploadUrl);
+                System.debug('Transcript ID received: ' + transcriptId);
+
+                logsToUpdate.add(new CallLog__c(
+                    Id = docToEntityMap.get(docId),
+                    transcriptId__c = transcriptId,
+                    transcript_Desc__c = 'Processing...',
+                    status__c = 'Processing',
+                    AgentID__c = AgentID,
+                    Client__c = ClientID,
+                    Contact__c = ContactID
+                    
+                ));
+            } catch (Exception e) {
+                System.debug('Error processing docId ' + docId + ': ' + e.getMessage());
+            }
+        }
+
+        // Step 1.7: Update CallLogs
+        if (!logsToUpdate.isEmpty()) {
+            update logsToUpdate;
+        }
+
+        System.debug('=== handleFileUpload END ===');
+    }
+
+    // Step 2: Upload audio to AssemblyAI
+    public static String uploadAudioToAssemblyAI(Id contentVersionId) {
+        ContentVersion cv = [
+            SELECT VersionData, Title, FileExtension
+            FROM ContentVersion
+            WHERE Id = :contentVersionId
+            LIMIT 1
+        ];
+
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('https://api.assemblyai.com/v2/upload');
+        req.setMethod('POST');
+        req.setHeader('Authorization', API_KEY);
+        req.setHeader('Transfer-Encoding', 'chunked');
+        req.setBodyAsBlob(cv.VersionData);
+
+        Http http = new Http();
+        HttpResponse res = http.send(req);
+
+        if (res.getStatusCode() == 200) {
+            Map<String, Object> result = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+            return (String) result.get('upload_url');
+        } else {
+            throw new CalloutException('Upload failed: ' + res.getBody());
+        }
+    }
+
+    // Step 3: Request transcription from AssemblyAI
+    public static String requestTranscription(String uploadUrl) {
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('https://api.assemblyai.com/v2/transcript');
+        req.setMethod('POST');
+        req.setHeader('Authorization', API_KEY);
+        req.setHeader('Content-Type', 'application/json');
+        req.setBody('{"audio_url": "' + uploadUrl + '"}');
+
+        Http http = new Http();
+        HttpResponse res = http.send(req);
+
+        if (res.getStatusCode() == 200 || res.getStatusCode() == 201) {
+            Map<String, Object> result = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+            return (String) result.get('id');
+        } else {
+            throw new CalloutException('Transcription request failed: ' + res.getBody());
+        }
+    }
+
+    // Step 4: Get transcription result using transcript ID
+    public static String getTranscriptionResult(String transcriptId) {
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('https://api.assemblyai.com/v2/transcript/' + transcriptId);
+        req.setMethod('GET');
+        req.setHeader('Authorization', API_KEY);
+
+        Http http = new Http();
+        HttpResponse res = http.send(req);
+
+        if (res.getStatusCode() == 200) {
+            Map<String, Object> result = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+            String status = (String) result.get('Call_Status__c');
+
+            return (String) result.get('text');
+            /*if (status == 'completed') {
+                return (String) result.get('text');
+            } else if (status == 'error') {
+                return 'Transcription failed: ' + result.get('error');
+            } else {
+                return ''; // Still processing
+            }*/
+        } else {
+            throw new CalloutException('Failed to get transcript status: ' + res.getBody());
+        }
+    }
+
+    // Step 5: Poll and update completed transcripts
+    /*public static void updateTranscriptDescriptions() {
+        System.debug('=== updateTranscriptDescriptions START ===');
+
+        List<CallLog__c> pending = [
+            SELECT Id, transcriptId__c, transcript_Desc__c, Call_Status__c	
+            FROM CallLog__c
+            WHERE transcriptId__c != null AND 
+                  (Call_Status__c = 'In-Progress')
+            LIMIT 200
+        ];
+        
+        System.debug('pending'+pending);
+        
+        List<CallLog__c> updates = new List<CallLog__c>();
+
+        for (CallLog__c log : pending) {
+            try {
+                String result = getTranscriptionResult(log.transcriptId__c);
+                System.debug('result ->'+result);
+
+                if (!String.isBlank(result)) {
+                    log.transcript_Desc__c = result;
+                    log.Call_Status__c = 'Completed';
+
+                    try {
+                        String jsonData = PromptInvoker.FetchRulesDetails(log.Id);
+                        InsertDataWithPromptResult.StringToJson(jsonData);
+                        System.debug('Prompt invoked for log: ' + log.Id);
+                    } catch (Exception ex) {
+                        System.debug('Prompt error for log ' + log.Id + ': ' + ex.getMessage());
+                    }
+
+                    updates.add(log);
+                }
+            } catch (Exception e) {
+                System.debug('Error fetching transcript for ID ' + log.transcriptId__c + ': ' + e.getMessage());
+            }
+        }
+
+        if (!updates.isEmpty()) {
+            update updates;
+        }
+
+        System.debug('=== updateTranscriptDescriptions END ===');
+    }*/
+    public static void updateTranscriptDescriptions() {
+    System.debug('=== updateTranscriptDescriptions START ===');
+
+    List<CallLog__c> pending = [
+        SELECT Id, transcriptId__c
+        FROM CallLog__c
+        WHERE transcriptId__c != null AND 
+              Call_Status__c = 'In-Progress'
+        LIMIT 100
+    ];
+
+    for (CallLog__c log : pending) {
+        System.enqueueJob(new TranscriptProcessorQueueable(log.Id, log.transcriptId__c));
+    }
+
+    System.debug('=== updateTranscriptDescriptions END ===');
+}
+
+    
+    
+    
+}
